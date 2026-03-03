@@ -1,0 +1,256 @@
+param(
+    [int]$MaxThreads    = 10,
+    [string]$OutputPath = (Split-Path -Parent $MyInvocation.MyCommand.Path),
+    [string]$SearchBase = ""   # Leave blank to auto-detect; override e.g. "OU=Staff,DC=corp,DC=com"
+)
+
+# Set error handling
+$ErrorActionPreference = 'Continue'
+$WarningPreference     = 'SilentlyContinue'
+
+# ─────────────────────────────────────────────
+# Pre-flight checks
+# ─────────────────────────────────────────────
+
+# Must run as Administrator
+$currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentPrincipal = [Security.Principal.WindowsPrincipal]$currentIdentity
+$adminRole        = [Security.Principal.WindowsBuiltInRole]::Administrator
+
+if (-not $currentPrincipal.IsInRole($adminRole)) {
+    Write-Host "ERROR: This script must be run as Administrator." -ForegroundColor Red
+    exit 1
+}
+
+# Active Directory module required
+try {
+    Import-Module ActiveDirectory -ErrorAction Stop
+}
+catch {
+    Write-Host "ERROR: Active Directory module not found. Install RSAT tools and retry." -ForegroundColor Red
+    exit 1
+}
+
+# Output path must exist
+if (-not (Test-Path $OutputPath)) {
+    Write-Host "ERROR: Output path does not exist: $OutputPath" -ForegroundColor Red
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────
+$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
+$csvPath   = Join-Path $OutputPath "AD_Users_$timestamp.csv"
+
+Write-Host ""
+Write-Host "╔══════════════════════════════════════════════╗" -ForegroundColor Cyan
+Write-Host "║     Active Directory User Export Script      ║" -ForegroundColor Cyan
+Write-Host "╚══════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+# ─────────────────────────────────────────────
+# Auto-detect domain root and Users OU
+# ─────────────────────────────────────────────
+try {
+    $domainDN = (Get-ADDomain -ErrorAction Stop).DistinguishedName
+    Write-Host "  Domain DN   : $domainDN" -ForegroundColor Gray
+}
+catch {
+    Write-Host "ERROR: Unable to contact Active Directory domain." -ForegroundColor Red
+    Write-Host "  Detail: $_" -ForegroundColor Red
+    exit 1
+}
+
+# Use provided SearchBase or auto-detect
+if (-not [string]::IsNullOrWhiteSpace($SearchBase)) {
+    Write-Host "  Search Base : $SearchBase (manual override)" -ForegroundColor Gray
+}
+else {
+    # Search for an OU named 'Users' anywhere in the domain
+    $usersOU = Get-ADOrganizationalUnit -Filter { Name -eq "Users" } `
+                   -SearchBase $domainDN -SearchScope Subtree -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+
+    if ($usersOU) {
+        $SearchBase = $usersOU.DistinguishedName
+        Write-Host "  Search Base : $SearchBase (auto-detected)" -ForegroundColor Gray
+    }
+    else {
+        # Fallback: search from domain root (catches CN=Users containers too)
+        $SearchBase = $domainDN
+        Write-Host "  WARNING: No 'Users' OU found — falling back to domain root: $SearchBase" -ForegroundColor Yellow
+        Write-Host "  Tip: Re-run with -SearchBase 'OU=YourOU,DC=...' to target a specific OU." -ForegroundColor Yellow
+    }
+}
+
+Write-Host "  Max Threads : $MaxThreads" -ForegroundColor Gray
+Write-Host "  Output File : $csvPath"    -ForegroundColor Gray
+Write-Host ""
+
+# ─────────────────────────────────────────────
+# Step 1 — Retrieve enabled user objects
+# ─────────────────────────────────────────────
+Write-Host "[Step 1/3] Querying Active Directory for enabled users..." -ForegroundColor Yellow
+
+try {
+    $adProperties = @(
+        'GivenName','Surname','DisplayName','Description',
+        'Office','TelephoneNumber','EmailAddress',
+        'UserPrincipalName','MobilePhone','Title',
+        'Department','Company','Manager','Enabled'
+    )
+
+    $users = @(
+        Get-ADUser -Filter { Enabled -eq $true } `
+                   -SearchBase  $SearchBase `
+                   -SearchScope Subtree `
+                   -Properties  $adProperties `
+                   -ErrorAction Stop
+    )
+
+    if ($users.Count -eq 0) {
+        Write-Host "WARNING: No enabled users found in '$SearchBase'. Exiting." -ForegroundColor Yellow
+        exit 0
+    }
+
+    Write-Host "  Found $($users.Count) enabled user(s)." -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: Failed to query Active Directory." -ForegroundColor Red
+    Write-Host "  Detail: $_"                             -ForegroundColor Red
+    exit 1
+}
+
+# ─────────────────────────────────────────────
+# Step 2 — Multi-threaded processing
+# ─────────────────────────────────────────────
+Write-Host ""
+Write-Host "[Step 2/3] Processing users across $MaxThreads thread(s)..." -ForegroundColor Yellow
+
+# Thread-safe shared collections
+$syncHash          = [System.Collections.Hashtable]::Synchronized(@{})
+$syncHash.Results  = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
+$syncHash.Errors   = [System.Collections.Concurrent.ConcurrentBag[string]]::new()
+
+# Scriptblock executed in each runspace
+$scriptBlock = {
+    param($user, $syncHash)
+
+    try {
+        # Resolve manager display name (DN → DisplayName)
+        $managerName = ""
+        if (-not [string]::IsNullOrEmpty($user.Manager)) {
+            try {
+                $mgr         = Get-ADUser -Identity $user.Manager `
+                                          -Properties DisplayName `
+                                          -ErrorAction Stop
+                $managerName = if ($mgr.DisplayName) { $mgr.DisplayName } else { $mgr.SamAccountName }
+            }
+            catch {
+                $syncHash.Errors.Add("Manager lookup failed for '$($user.UserPrincipalName)': $_")
+                $managerName = "Lookup Failed"
+            }
+        }
+
+        # Helper: return empty string for null/blank values
+        $v = { param($val) if ([string]::IsNullOrWhiteSpace($val)) { "" } else { $val.Trim() } }
+
+        $syncHash.Results.Add([PSCustomObject]@{
+            'First Name'      = & $v $user.GivenName
+            'Last Name'       = & $v $user.Surname
+            'Display Name'    = & $v $user.DisplayName
+            'Description'     = & $v $user.Description
+            'Office'          = & $v $user.Office
+            'Telephone'       = & $v $user.TelephoneNumber
+            'Email'           = & $v $user.EmailAddress
+            'User Logon Name' = & $v $user.UserPrincipalName
+            'Mobile Number'   = & $v $user.MobilePhone
+            'Job Title'       = & $v $user.Title
+            'Department'      = & $v $user.Department
+            'Company'         = & $v $user.Company
+            'Manager'         = $managerName
+        })
+    }
+    catch {
+        $syncHash.Errors.Add("Critical error for '$($user.UserPrincipalName)': $_")
+    }
+}
+
+# Build and open runspace pool
+$runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+$runspacePool.Open()
+
+# Dispatch one runspace job per user
+$jobs = foreach ($user in $users) {
+    $ps = [powershell]::Create()
+    $ps.RunspacePool = $runspacePool
+    $null = $ps.AddScript($scriptBlock).AddArgument($user).AddArgument($syncHash)
+
+    [PSCustomObject]@{
+        PowerShell = $ps
+        Handle     = $ps.BeginInvoke()
+        UPN        = $user.UserPrincipalName
+    }
+}
+
+# Progress bar — poll until all jobs finish
+$total = $jobs.Count
+do {
+    $done    = @($jobs | Where-Object { $_.Handle.IsCompleted }).Count
+    $pct     = [math]::Round(($done / $total) * 100)
+    $elapsed = $syncHash.Results.Count
+
+    Write-Progress -Activity "Processing AD Users" `
+                   -Status   "$done of $total completed  |  $elapsed records captured" `
+                   -PercentComplete $pct
+
+    Start-Sleep -Milliseconds 150
+} while ($done -lt $total)
+
+Write-Progress -Activity "Processing AD Users" -Completed
+
+# Collect results and clean up runspaces
+foreach ($job in $jobs) {
+    try   { $null = $job.PowerShell.EndInvoke($job.Handle) }
+    catch { $syncHash.Errors.Add("EndInvoke error for '$($job.UPN)': $_") }
+    $job.PowerShell.Dispose()
+}
+$runspacePool.Close()
+$runspacePool.Dispose()
+
+Write-Host "  Processed : $($syncHash.Results.Count) user(s) successfully" -ForegroundColor Green
+
+if ($syncHash.Errors.Count -gt 0) {
+    Write-Host "  Warnings  : $($syncHash.Errors.Count) non-fatal error(s) encountered:" -ForegroundColor Yellow
+    $syncHash.Errors | ForEach-Object { Write-Host "    • $_" -ForegroundColor DarkYellow }
+}
+
+# ─────────────────────────────────────────────
+# Step 3 — Export to CSV
+# ─────────────────────────────────────────────
+Write-Host ""
+Write-Host "[Step 3/3] Exporting results to CSV..." -ForegroundColor Yellow
+
+try {
+    if ($syncHash.Results.Count -eq 0) {
+        Write-Host "WARNING: No records to export. CSV will not be created." -ForegroundColor Yellow
+        exit 0
+    }
+
+    $syncHash.Results |
+        Sort-Object 'Display Name' |
+        Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+
+    Write-Host "  Status  : Export successful"              -ForegroundColor Green
+    Write-Host "  File    : $csvPath"                       -ForegroundColor Green
+    Write-Host "  Records : $($syncHash.Results.Count)"     -ForegroundColor Green
+}
+catch {
+    Write-Host "ERROR: CSV export failed."  -ForegroundColor Red
+    Write-Host "  Detail: $_"               -ForegroundColor Red
+    exit 1
+}
+
+Write-Host ""
+Write-Host "Script completed successfully." -ForegroundColor Cyan
+Write-Host ""
